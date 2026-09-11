@@ -60,7 +60,18 @@ Turn it off in the menu if you'd rather.
 
 The corner pill is clickable too, if you'd rather use the mouse for both ends. **Drag it to any
 edge** and it snaps flush and stays there — the panel then opens inward from that edge, so it
-never sweeps across your screen.
+never sweeps across your screen. With more than one display, drag it onto whichever one you want;
+it follows the pointer across and remembers that display between launches.
+
+You can start a new dictation while the previous one is still finishing. The earlier words land
+where they were meant to when they arrive; the panel belongs to the new recording.
+
+**Mid-sentence dictation reads as one sentence.** Speech-to-text capitalises the first word of
+everything it hears, which is right at the start of a sentence and wrong in the middle of one. If
+the words land after an unfinished sentence — `so I was thinking |` — the first word is lowercased,
+and a full stop the service tacked on is dropped when the rest of your sentence follows the caret.
+Names, `I`, acronyms and days and months keep their capitals; at the start of a line, a list item,
+or after a full stop nothing is changed. German, which capitalises nouns, is left alone.
 
 ### Say "open Grok" to start
 
@@ -168,15 +179,18 @@ back the same way. You cannot lose your words to this feature.
 Quill doesn't simulate `⌘V` and doesn't touch your clipboard.
 
 1. It asks Accessibility for the focused element.
-2. It reads what's already in that field and puts the caret after the last character.
-3. It writes the text into the selection, adding a space on either side if the words would
-   otherwise run together — but not after an opening bracket, before a comma, or where there's
-   already a space or a line break.
+2. It reads what's already in that field and, if **Insert at end of field** is on, puts the caret
+   after the last character. Otherwise the words go where your caret is.
+3. It fits the text to what is around it: lowercases a first word that lands mid-sentence, drops a
+   trailing full stop when more of the same sentence follows, and adds a space on either side if
+   the words would otherwise run together — but not after an opening bracket, before a comma,
+   between Chinese or Japanese characters, or where there's already a space or a line break.
+4. It writes the text into the selection.
 
 Terminals, canvases and most web views expose no editable text to Accessibility. Those fall back
-to a synthetic `⌘V` — but the caret is still moved to the end first where possible, and your
-previous clipboard contents are snapshotted and restored afterwards. Either way, what you had
-copied is still there when it's done.
+to a synthetic `⌘V` — but the text is fitted and the caret is still moved first where possible,
+and your previous clipboard contents are snapshotted and restored afterwards. Either way, what you
+had copied is still there when it's done.
 
 ## Using your own xAI API key
 
@@ -253,12 +267,24 @@ Verify the transcription path without a microphone:
 ```sh
 # 16 kHz mono PCM16: ffmpeg -i in.wav -ar 16000 -ac 1 -f s16le out.pcm
 QUILL_SELFTEST=out.pcm ~/Applications/Quill.app/Contents/MacOS/Quill
+# …and also insert the result into whatever field is focused, then read it back:
+QUILL_SELFTEST=out.pcm QUILL_SELFTEST_INSERT=1 ~/Applications/Quill.app/Contents/MacOS/Quill
+```
+
+Unit tests for the text fitting and the voice-command matching, no app or network needed:
+
+```sh
+./tests/run.sh
 ```
 
 ## Known limits
 
 - Settings live per-machine and don't sync.
-- A recording stops itself after 5 minutes, or after 10 seconds if it hears nothing at all.
+- A recording stops itself after 5 minutes. If nothing has come back after 10 seconds while the
+  microphone is clearly working, Quill reconnects once and replays what it heard; if that fails
+  too, it tells you which part broke — microphone, network, or the service.
+- If the connection drops mid-dictation, Quill reconnects once with the audio replayed. If it
+  drops again, whatever was transcribed so far is inserted rather than thrown away.
 - If your Grok token has expired and `grok` isn't running to refresh it, Quill says so rather than
   failing quietly.
 - Not notarised — see above.
