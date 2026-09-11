@@ -36,8 +36,19 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
     private var segments: [Double: String] = [:]
     private var didFinish = false
     private var doneTimer: Timer?
+    private var connectTimer: Timer?
     private var socketOpen = false
     private var finishRequested = false
+    private var doneSent = false
+    private var connectedAt: Date?
+
+    /// How long to keep waiting for a still-connecting socket once the user has
+    /// asked to finish. Without a bound the session sat on "Transcribing" until
+    /// the URL timeout — 20 seconds, or longer when the connection was half-dead
+    /// — which reads as the app hanging. Generous, because the alternative is
+    /// losing the words: a cold connection takes about two seconds, so a socket
+    /// that has not opened eight seconds after the recording ended is not going to.
+    private let connectGrace: TimeInterval = 8.0
 
     /// Best transcript so far — fires on every partial.
     var onText: (String) -> Void = { _ in }
@@ -45,11 +56,16 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
     var onReady: () -> Void = {}
     /// Terminal: the complete transcript.
     var onComplete: (String) -> Void = { _ in }
+    /// Terminal: the stream is dead. `transcript` still holds whatever arrived
+    /// before it died, so the caller can decide to keep it.
     var onFailure: (Failure) -> Void = { _ in }
 
     var transcript: String {
         segmentOrder.compactMap { segments[$0] }.joined(separator: " ")
     }
+
+    /// True once the socket has opened and audio is actually being accepted.
+    var isOpen: Bool { socketOpen }
 
     private func record(start: Double, text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -80,6 +96,7 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         config.waitsForConnectivity = false
         session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
 
+        connectedAt = Date()
         let socket = session.webSocketTask(with: request)
         task = socket
         socket.resume()
@@ -96,7 +113,9 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
     /// on the first recording after launch, where DNS and the TLS handshake are
     /// still in flight — the request is held until it opens, so the buffered audio
     /// is still sent and still transcribed. Ending the session early here is what
-    /// made the first dictation silently produce nothing.
+    /// made the first dictation silently produce nothing. The wait is bounded:
+    /// if the socket never opens, the session completes with whatever it has and
+    /// the caller shows the real "couldn't reach speech-to-text" message.
     func finish() {
         guard !didFinish else { return }
         if socketOpen {
@@ -104,10 +123,20 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         } else {
             Log.write("  finish deferred — socket still connecting, audio held")
             finishRequested = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.didFinish, !self.socketOpen else { return }
+                self.connectTimer?.invalidate()
+                self.connectTimer = Timer.scheduledTimer(withTimeInterval: self.connectGrace, repeats: false) { [weak self] _ in
+                    guard let self, !self.didFinish, !self.socketOpen else { return }
+                    Log.write("  gave up waiting for the socket after \(Int(self.connectGrace))s")
+                    self.complete()
+                }
+            }
         }
     }
 
     private func sendDone() {
+        doneSent = true
         task?.send(.string(#"{"type":"audio.done"}"#)) { _ in }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -121,6 +150,7 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
     func cancel() {
         didFinish = true
         doneTimer?.invalidate()
+        connectTimer?.invalidate()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         session?.invalidateAndCancel()
@@ -130,11 +160,23 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         guard !didFinish else { return }
         didFinish = true
         doneTimer?.invalidate()
+        connectTimer?.invalidate()
         let text = transcript
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         session?.finishTasksAndInvalidate()
         DispatchQueue.main.async { [weak self] in self?.onComplete(text) }
+    }
+
+    private func fail(_ failure: Failure) {
+        guard !didFinish else { return }
+        didFinish = true
+        doneTimer?.invalidate()
+        connectTimer?.invalidate()
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        session?.invalidateAndCancel()
+        DispatchQueue.main.async { [weak self] in self?.onFailure(failure) }
     }
 
     private func receive() {
@@ -155,7 +197,8 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func handle(json: String) {
-        guard let data = json.data(using: .utf8),
+        guard !didFinish,
+              let data = json.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["type"] as? String
         else { return }
@@ -165,7 +208,10 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
             record(start: (object["start"] as? Double) ?? 0,
                    text: (object["text"] as? String) ?? "")
             let snapshot = transcript
-            DispatchQueue.main.async { [weak self] in self?.onText(snapshot) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.didFinish else { return }
+                self.onText(snapshot)
+            }
 
         case "transcript.created":
             break
@@ -184,7 +230,9 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
             let message = (object["message"] as? String)
                 ?? (object["error"] as? String)
                 ?? "Transcription error"
-            DispatchQueue.main.async { [weak self] in self?.onFailure(.server(message)) }
+            // After audio.done a server error changes nothing about the words
+            // already received — deliver them rather than throwing them away.
+            if doneSent, !transcript.isEmpty { complete() } else { fail(.server(message)) }
 
         default:
             break
@@ -195,23 +243,41 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         guard !didFinish else { return }
 
         if let response = task?.response as? HTTPURLResponse, response.statusCode == 401 || response.statusCode == 403 {
-            didFinish = true
-            DispatchQueue.main.async { [weak self] in self?.onFailure(.unauthorized) }
+            fail(.unauthorized)
             return
         }
 
-        // A normal server-side close after audio.done arrives here as an error.
-        if !transcript.isEmpty {
+        // Once we have said audio.done, the server closing the socket is the
+        // normal end of the conversation and arrives here as an error. Before
+        // that it is a genuine drop mid-dictation, and the caller decides
+        // whether to reconnect or to keep the words that made it through.
+        if doneSent {
             complete()
             return
         }
+        fail(.offline(Self.describe(error)))
+    }
 
-        didFinish = true
+    /// Something a person can act on, rather than a POSIX error string.
+    private static func describe(_ error: Error) -> String {
         let ns = error as NSError
-        let message = ns.code == NSURLErrorNotConnectedToInternet
-            ? "No network connection"
-            : ns.localizedDescription
-        DispatchQueue.main.async { [weak self] in self?.onFailure(.offline(message)) }
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorNotConnectedToInternet:    return "No network connection"
+            case NSURLErrorTimedOut:                  return "Speech-to-text did not answer in time"
+            case NSURLErrorCannotFindHost,
+                 NSURLErrorCannotConnectToHost,
+                 NSURLErrorDNSLookupFailed:           return "Couldn't reach speech-to-text — check your connection"
+            case NSURLErrorNetworkConnectionLost:     return "Lost the connection to speech-to-text"
+            case NSURLErrorSecureConnectionFailed:    return "Secure connection to speech-to-text failed"
+            default: break
+            }
+        }
+        if ns.domain == NSPOSIXErrorDomain {
+            // ENOTCONN (57), ECONNRESET (54), EPIPE (32), ETIMEDOUT (60)
+            return "Lost the connection to speech-to-text"
+        }
+        return ns.localizedDescription
     }
 
     // MARK: URLSessionWebSocketDelegate
@@ -221,7 +287,15 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
                     didOpenWithProtocol protocol: String?) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.connectTimer?.invalidate()
+            self.connectTimer = nil
+            // The grace timer may already have completed the session; a late open
+            // is then nothing to act on.
+            guard !self.didFinish else { return }
             self.socketOpen = true
+            if let started = self.connectedAt {
+                Log.write("  socket open in \(Int(Date().timeIntervalSince(started) * 1000))ms")
+            }
             self.onReady()                       // flushes whatever was buffered
             if self.finishRequested { self.sendDone() }
         }
@@ -232,13 +306,10 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                     reason: Data?) {
         guard !didFinish else { return }
-        if !transcript.isEmpty {
+        if doneSent {
             complete()
         } else {
-            didFinish = true
-            DispatchQueue.main.async { [weak self] in
-                self?.onFailure(.server("Connection closed (code \(closeCode.rawValue))"))
-            }
+            fail(.server("Speech-to-text closed the connection (code \(closeCode.rawValue))"))
         }
     }
 }

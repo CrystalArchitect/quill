@@ -58,41 +58,95 @@ enum Defaults {
     static func flip(_ key: String) { UserDefaults.standard.set(!bool(key), forKey: key) }
 }
 
-// MARK: - App
+// MARK: - Session
 
-final class QuillApp: NSObject, NSApplicationDelegate {
+/// One dictation, from the trigger to the words landing.
+///
+/// Everything that belongs to a single recording lives here, so a new dictation
+/// can begin while the previous one is still waiting for its last words without
+/// the two trampling each other. That used to happen through shared fields on
+/// the app: the older session's completion cleared the client the newer one
+/// was recording into, so the newer one could never be told to finish — it sat
+/// on "Transcribing" until the socket timed out a minute later, and the words
+/// were lost.
+private final class Session {
 
-    private enum StopReason {
+    enum Phase {
+        case recording      // microphone open, audio streaming
+        case finalising     // stopped; waiting for the transcript tail
+        case delivering     // transcript final; writing it into the target
+    }
+
+    enum StopReason {
         case hotkey     // trigger key or the pill — focus has not moved
         case click      // you clicked into the target — give focus a beat to settle
         case voice      // you said "that's it" — focus has not moved either
     }
 
+    var phase: Phase = .recording
+    var client: STTClient
+    var stopReason: StopReason = .hotkey
+    let selection: Inserter.Selection?
+    let startedAt = Date()
+    var finaliseStartedAt: Date?
+
+    /// The corner panel belongs to the newest session. An older one that is
+    /// still finishing inserts its words quietly rather than flashing "Inserted"
+    /// over the top of a recording in progress.
+    var ownsHUD = true
+
+    // Audio. Everything captured is kept for the life of the session, so the
+    // socket can be handed the backlog when it opens — however long that takes —
+    // and so a reconnect can replay the whole dictation from the start.
+    var socketReady = false
+    var audio: [Data] = []
+    var audioBytes = 0
+    var sentChunks = 0
+    var didReconnect = false
+
+    // Transcript.
+    var sawAnyText = false
+    var lastActivityText: String?
+    var lastVoiceAt = Date()
+    var noiseFloor: Float = 0.02
+    var lastStopCandidate: String?
+    var pendingVoiceStop: DispatchWorkItem?
+
+    // Voice commands.
+    var didRunVoiceCommand = false
+    /// Once "open Grok" has launched a session, clicks are for using that
+    /// session (select, copy), not for picking a Quill destination.
+    var deliverToOpenedGrok = false
+
+    init(client: STTClient, selection: Inserter.Selection?) {
+        self.client = client
+        self.selection = selection
+    }
+
+    var isRecording: Bool { phase == .recording }
+}
+
+// MARK: - App
+
+final class QuillApp: NSObject, NSApplicationDelegate {
+
     private let hotkey = DoubleTapRightCommand()
     private let recorder = Recorder()
     private let hud = HUD()
-    private var stt: STTClient?
+
+    /// The newest dictation — recording, or finishing and still owning the panel.
+    private var session: Session?
+    /// Older dictations displaced by a newer one, kept alive until their words
+    /// have landed.
+    private var superseded: [Session] = []
+
+    private var isRecording: Bool { session?.isRecording ?? false }
+
+    /// Five minutes of 16 kHz PCM16 — the most a recording is allowed to run.
+    private static let maxAudioBytes = 16_000 * 2 * 320
 
     private var statusItem: NSStatusItem!
-    private var isRecording = false
-    private var pendingPCM: [Data] = []
-    private var socketReady = false
-    private var sawAnyText = false
-    private var stopReason: StopReason = .hotkey
-    private var didRunVoiceCommand = false
-    /// Once "open Grok" has launched a session, clicks are for using that
-    /// session (select, copy), not for picking a Quill destination.
-    private var deliverToOpenedGrok = false
-    private var finaliseStartedAt: Date?
-    private var pendingVoiceStop: DispatchWorkItem?
-    private var lastStopCandidate: String?
     private var pauseTimer: Timer?
-    private var lastVoiceAt = Date()
-    private var lastActivityText: String?
-    private var noiseFloor: Float = 0.02
-    private var capturedSelection: Inserter.Selection?
-    private var startedAt: Date?
-
     private var silenceTimer: Timer?
     private var maxDurationTimer: Timer?
     private var tickTimer: Timer?
@@ -103,6 +157,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     /// file, so the socket → transcript → insert path can be verified headlessly.
     private let selfTestPath = ProcessInfo.processInfo.environment["QUILL_SELFTEST"]
     private var selfTestTimer: Timer?
+    private var selfTestOverlapPending = ProcessInfo.processInfo.environment["QUILL_SELFTEST_OVERLAP"] != nil
     private let setup = SetupWindow()
 
     /// Grok STT's own list, plus Chinese.
@@ -631,10 +686,10 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
         // Grab the highlighted text now — clicking a destination later would
         // destroy it, and this is the only moment it is reliably present.
-        capturedSelection = Inserter.captureSelection()
+        let selection = Inserter.captureSelection()
 
         if selfTestPath != nil {
-            beginCapture()
+            beginCapture(replacing: selection)
             return
         }
 
@@ -646,153 +701,234 @@ final class QuillApp: NSObject, NSApplicationDelegate {
                 Inserter.openPrivacyPane("Privacy_Microphone")
                 return
             }
-            self.beginCapture()
+            self.beginCapture(replacing: selection)
         }
     }
 
-    private func beginCapture() {
+    private func beginCapture(replacing selection: Inserter.Selection?) {
         guard let creds = Auth.current() else {
             hud.apply(.notice("No Grok Build session found — run `grok` once to sign in"))
             hud.collapse(after: 4)
             return
         }
 
-        let client = STTClient()
-        stt = client
-        pendingPCM = []
-        socketReady = false
-        sawAnyText = false
-        stopReason = .hotkey
-        didRunVoiceCommand = false
-        deliverToOpenedGrok = false
-        lastStopCandidate = nil
+        let session = Session(client: STTClient(), selection: selection)
 
-        client.onReady = { [weak self] in
-            guard let self else { return }
-            self.socketReady = true
-            for chunk in self.pendingPCM { client.send(pcm: chunk) }
-            self.pendingPCM = []
+        // The previous dictation may still be waiting for its last words. It
+        // keeps them and inserts them on its own; only the panel changes hands.
+        if let previous = self.session {
+            previous.ownsHUD = false
+            superseded.append(previous)
+            Log.write("previous dictation still \(previous.phase == .finalising ? "finalising" : "inserting") — it will land on its own")
         }
-        client.onText = { [weak self] text in
-            guard let self, !text.isEmpty else { return }
-            self.sawAnyText = true
-
-            if !self.didRunVoiceCommand, VoiceCommands.containsOpenGrok(text) {
-                self.didRunVoiceCommand = true
-                self.runOpenGrok()
-            }
-
-            self.considerVoiceStop(after: text)
-            // Only NEW words count as activity. The server re-sends an unchanged
-            // partial every couple of hundred milliseconds, so treating every
-            // callback as speech kept the session alive forever.
-            if text != self.lastActivityText {
-                self.lastActivityText = text
-                self.noteVoiceActivity()
-            }
-
-            // Show what will actually be inserted, command phrases already removed.
-            self.hud.update(text: VoiceCommands.stripAll(text))
-        }
-        client.onComplete = { [weak self] text in self?.finishSession(with: text) }
-        client.onFailure = { [weak self] failure in self?.abortSession(message: failure.message) }
+        self.session = session
+        attach(session.client, to: session)
 
         // Open the connection while they are still talking: a cold request
         // measured ~1.9s against ~0.8s warm, which is the whole difference
         // between this feeling instant and feeling like a wait.
         if Defaults.bool(Defaults.polish) { Polisher.warm(token: creds.token) }
 
-        client.connect(token: creds.token,
-                       language: UserDefaults.standard.string(forKey: Defaults.language) ?? "en")
+        session.client.connect(token: creds.token, language: currentLanguage)
 
-        recorder.onPCM = { [weak self] data in
-            guard let self else { return }
-            if self.socketReady { client.send(pcm: data) }
-            else if self.pendingPCM.count < 200 { self.pendingPCM.append(data) }
-        }
-        recorder.onLevel = { [weak self] level in
+        // Audio arrives on the capture thread. Everything that touches the
+        // session happens on the main queue, so the flush-on-open and the live
+        // stream can never race each other over the same buffer.
+        recorder.onPCM = { [weak self, weak session] data in
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.observe(level: level)
+                guard let self, let session, session.isRecording, session === self.session else { return }
+                self.capture(data, for: session)
+            }
+        }
+        recorder.onLevel = { [weak self, weak session] level in
+            DispatchQueue.main.async {
+                guard let self, let session, session.isRecording, session === self.session else { return }
+                self.observe(level: level, for: session)
                 self.hud.update(level: level)
             }
         }
 
         if let selfTestPath {
-            startSelfTest(path: selfTestPath, client: client)
+            startSelfTest(path: selfTestPath, for: session)
             return
         }
 
         do {
             try recorder.start()
         } catch {
-            stt?.cancel()
-            stt = nil
+            session.client.cancel()
+            release(session)
             hud.apply(.notice(error.localizedDescription))
             hud.collapse(after: 3.5)
             return
         }
 
-        enterRecordingState()
+        enterRecordingState(session)
     }
 
-    private func enterRecordingState() {
-        isRecording = true
-        startedAt = Date()
+    private var currentLanguage: String {
+        UserDefaults.standard.string(forKey: Defaults.language) ?? "en"
+    }
+
+    /// Wires a socket to its session. Every callback checks that the socket is
+    /// still the one the session is using — after a reconnect the old one may
+    /// still have a message in flight — and that the session is still current
+    /// before touching anything shared, like the panel.
+    private func attach(_ client: STTClient, to session: Session) {
+        client.onReady = { [weak self, weak session, weak client] in
+            guard let self, let session, let client, client === session.client else { return }
+            session.socketReady = true
+            // Hand over everything this socket has not seen: the backlog that
+            // piled up while it was connecting, or the whole dictation after a
+            // reconnect.
+            let backlog = session.audio[session.sentChunks...]
+            for chunk in backlog { client.send(pcm: chunk) }
+            session.sentChunks = session.audio.count
+            if !backlog.isEmpty {
+                Log.write("  flushed \(backlog.count) buffered chunks (\(backlog.reduce(0) { $0 + $1.count } / 32000)s)")
+            }
+            if session.didReconnect, session.ownsHUD, session.isRecording {
+                self.hud.flashTarget("reconnected", for: 1.5)
+            }
+        }
+        client.onText = { [weak self, weak session, weak client] text in
+            guard let self, let session, let client, client === session.client, !text.isEmpty else { return }
+            session.sawAnyText = true
+
+            if session.isRecording {
+                if !session.didRunVoiceCommand, VoiceCommands.containsOpenGrok(text) {
+                    session.didRunVoiceCommand = true
+                    self.runOpenGrok(for: session)
+                }
+                self.considerVoiceStop(session, after: text)
+            }
+            // Only NEW words count as activity. The server re-sends an unchanged
+            // partial every couple of hundred milliseconds, so treating every
+            // callback as speech kept the session alive forever.
+            if text != session.lastActivityText {
+                session.lastActivityText = text
+                session.lastVoiceAt = Date()
+            }
+
+            // Show what will actually be inserted, command phrases already removed.
+            if session.ownsHUD { self.hud.update(text: VoiceCommands.stripAll(text)) }
+        }
+        client.onComplete = { [weak self, weak session, weak client] text in
+            guard let self, let session, let client, client === session.client else { return }
+            self.finishSession(session, with: text)
+        }
+        client.onFailure = { [weak self, weak session, weak client] failure in
+            guard let self, let session, let client, client === session.client else { return }
+            self.handleFailure(session, failure)
+        }
+    }
+
+    /// One chunk of 16 kHz PCM16 from the microphone (or the self-test file).
+    private func capture(_ data: Data, for session: Session) {
+        guard session.audioBytes < Self.maxAudioBytes else { return }
+        session.audio.append(data)
+        session.audioBytes += data.count
+        if session.socketReady {
+            session.client.send(pcm: data)
+            session.sentChunks = session.audio.count
+        }
+    }
+
+    private func enterRecordingState(_ session: Session) {
         refreshIcon()
         hud.apply(.listening)
-        if let selection = capturedSelection {
+        if let selection = session.selection {
             hud.flashTarget("replacing \(selection.range.length) selected characters", for: 3)
         }
         let front = Inserter.frontmostApp()
         hud.update(target: front.name, icon: front.icon)
         hotkey.watchClicks = Defaults.bool(Defaults.clickToInsert)
         hotkey.watchForCancel(true)
-        lastVoiceAt = Date()
-        lastActivityText = nil
-        noiseFloor = 0.02
-        startPauseWatch()
+        startPauseWatch(session)
         Log.write("recording started — watchClicks=\(hotkey.watchClicks)")
 
-        tickTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self, let startedAt = self.startedAt else { return }
-            self.hud.update(elapsed: Date().timeIntervalSince(startedAt))
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self, weak session] _ in
+            guard let self, let session, session.isRecording else { return }
+            self.hud.update(elapsed: Date().timeIntervalSince(session.startedAt))
             let front = Inserter.frontmostApp()
             self.hud.update(target: front.name, icon: front.icon)
         }
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
-            guard let self, self.isRecording, !self.sawAnyText else { return }
-            self.logAudioState()
-            self.abortSession(message: self.diagnosis())
-        }
-        maxDurationTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self] _ in
-            guard let self, self.isRecording else { return }
+        armSilenceWatch(session)
+        maxDurationTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self, weak session] _ in
+            guard let self, let session, session.isRecording, session === self.session else { return }
             self.stopSession(reason: .hotkey)
         }
     }
 
-    private func startSelfTest(path: String, client: STTClient) {
+    /// Nothing heard back after ten seconds. Which of four different failures
+    /// that is matters: a dead microphone and a dead network used to be
+    /// indistinguishable. If the audio side is healthy the socket gets one more
+    /// chance — a fresh connection with the whole dictation replayed into it —
+    /// before the session is given up on.
+    private func armSilenceWatch(_ session: Session) {
+        silenceTimer?.invalidate()
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self, weak session] _ in
+            guard let self, let session, session.isRecording, session === self.session, !session.sawAnyText else { return }
+            self.logAudioState(session)
+            if self.microphoneLooksHealthy, self.reconnect(session, why: "no transcript after 10s") {
+                self.armSilenceWatch(session)
+            } else {
+                self.abortSession(session, message: self.diagnosis(session))
+            }
+        }
+    }
+
+    private var microphoneLooksHealthy: Bool {
+        recorder.framesCaptured > 0 && recorder.peakLevel >= 0.004
+    }
+
+    /// Replace the socket without interrupting the recording. Once per session:
+    /// if a second connection also fails, the problem is not transient.
+    private func reconnect(_ session: Session, why: String) -> Bool {
+        guard session.isRecording, !session.didReconnect, let creds = Auth.current() else { return false }
+        session.didReconnect = true
+        Log.write("reconnecting speech-to-text — \(why); replaying \(session.audioBytes / 32000)s of audio")
+
+        session.client.cancel()
+        let client = STTClient()
+        session.client = client
+        session.socketReady = false
+        session.sentChunks = 0
+        attach(client, to: session)
+        client.connect(token: creds.token, language: currentLanguage)
+        if session.ownsHUD { hud.flashTarget("reconnecting…", for: 4) }
+        return true
+    }
+
+    private func startSelfTest(path: String, for session: Session) {
         guard let pcm = FileManager.default.contents(atPath: path) else {
             FileHandle.standardError.write(Data("SELFTEST: cannot read \(path)\n".utf8))
             NSApp.terminate(nil)
             return
         }
 
-        enterRecordingState()
+        enterRecordingState(session)
         FileHandle.standardError.write(Data("SELFTEST: streaming \(pcm.count / 32000)s of audio\n".utf8))
 
         var offset = 0
         let chunk = 3200
-        selfTestTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] timer in
-            guard let self else { timer.invalidate(); return }
+        selfTestTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self, weak session] timer in
+            guard let self, let session, session.isRecording else { timer.invalidate(); return }
             guard offset < pcm.count else {
                 timer.invalidate()
                 self.stopSession(reason: .hotkey)
+                // QUILL_SELFTEST_OVERLAP: start the next dictation the instant
+                // this one stops, while its transcript is still in flight — the
+                // situation that used to strand both.
+                if self.selfTestOverlapPending {
+                    self.selfTestOverlapPending = false
+                    FileHandle.standardError.write(Data("SELFTEST: starting a second dictation while the first finalises\n".utf8))
+                    self.startSession()
+                }
                 return
             }
             let end = min(offset + chunk, pcm.count)
-            let slice = pcm.subdata(in: offset..<end)
-            if self.socketReady { client.send(pcm: slice) } else { self.pendingPCM.append(slice) }
+            self.capture(pcm.subdata(in: offset..<end), for: session)
             offset = end
         }
     }
@@ -800,45 +936,45 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     /// Why did nothing come back? "No speech detected" was covering four
     /// completely different failures, which made a broken microphone and a broken
     /// network indistinguishable.
-    private func diagnosis() -> String {
+    private func diagnosis(_ session: Session) -> String {
         if recorder.framesCaptured == 0 {
             return "No audio from the microphone — check Sound ▸ Input"
         }
         if recorder.peakLevel < 0.004 {
             return "Microphone is silent — wrong input device, or muted"
         }
-        if !socketReady {
+        if !session.socketReady {
             return "Couldn't reach speech-to-text — check your connection"
         }
         return "Heard you, but no transcript came back"
     }
 
-    private func logAudioState() {
+    private func logAudioState(_ session: Session) {
         Log.write("  audio: input=\(recorder.inputDescription) "
             + "frames=\(recorder.framesCaptured) peak=\(String(format: "%.4f", recorder.peakLevel)) "
-            + "socketReady=\(socketReady) sawText=\(sawAnyText)")
+            + "buffered=\(session.audioBytes / 32000)s socketReady=\(session.socketReady) sawText=\(session.sawAnyText)")
     }
 
     /// Opens Grok Build without interrupting the recording. Only fired when the
     /// transcript *starts* with the command, so the rest of that opening
     /// sentence can still become the prompt.
-    private func runOpenGrok() {
+    private func runOpenGrok(for session: Session) {
         Log.write("voice command: open Grok")
-        hud.flashTarget("opening Grok Build…", for: 8)
-        GrokLauncher.open { [weak self] outcome in
-            guard let self else { return }
+        if session.ownsHUD { hud.flashTarget("opening Grok Build…", for: 8) }
+        GrokLauncher.open { [weak self, weak session] outcome in
+            guard let self, let session else { return }
             switch outcome {
             case .opened(let terminal):
                 // A click in the new Grok window used to be treated as
                 // "insert here", which posted ⌘V into the TUI and made
                 // select/copy impossible. The destination is already Grok.
-                self.hotkey.watchClicks = false
-                self.deliverToOpenedGrok = true
+                session.deliverToOpenedGrok = true
+                if session === self.session, session.isRecording { self.hotkey.watchClicks = false }
                 Log.write("  click-to-insert off — Grok is the destination")
-                self.hud.flashTarget("Grok Build opened in \(terminal)", for: 2)
+                if session.ownsHUD { self.hud.flashTarget("Grok Build opened in \(terminal)", for: 2) }
             case .failed(let message):
                 Log.write("  open Grok failed — \(message)")
-                self.hud.flashTarget("couldn't open Grok Build", for: 4)
+                if session.ownsHUD { self.hud.flashTarget("couldn't open Grok Build", for: 4) }
             }
         }
     }
@@ -846,19 +982,19 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     /// Stop when "that's it" is the last thing said — but only after a beat of
     /// silence, so a mid-sentence "that's it exactly" cannot cut someone off. Any
     /// further speech cancels the pending stop.
-    private func considerVoiceStop(after text: String) {
+    private func considerVoiceStop(_ session: Session, after text: String) {
         if ProcessInfo.processInfo.environment["QUILL_TRACE_STOP"] != nil {
             Log.write("  tail? \"…\(String(text.suffix(20)))\" ends=\(VoiceCommands.endsWithStopPhrase(text)) "
-                + "pending=\(pendingVoiceStop != nil)")
+                + "pending=\(session.pendingVoiceStop != nil)")
         }
 
-        guard Defaults.bool(Defaults.stopPhrase), isRecording,
+        guard Defaults.bool(Defaults.stopPhrase), session.isRecording,
               VoiceCommands.endsWithStopPhrase(text)
         else {
             // Speech continued past the phrase, or the feature is off — stand down.
-            pendingVoiceStop?.cancel()
-            pendingVoiceStop = nil
-            lastStopCandidate = nil
+            session.pendingVoiceStop?.cancel()
+            session.pendingVoiceStop = nil
+            session.lastStopCandidate = nil
             return
         }
 
@@ -866,36 +1002,27 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         // re-sends an unchanged partial every couple of hundred milliseconds while
         // it works through the audio, and treating those as new speech pushed the
         // deadline back forever, so the stop never fired at all.
-        if text == lastStopCandidate, pendingVoiceStop != nil { return }
-        lastStopCandidate = text
+        if text == session.lastStopCandidate, session.pendingVoiceStop != nil { return }
+        session.lastStopCandidate = text
 
-        pendingVoiceStop?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isRecording else { return }
+        session.pendingVoiceStop?.cancel()
+        let work = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session, session.isRecording, session === self.session else { return }
             Log.write("voice stop: heard the finish phrase")
             self.hud.flashTarget("finishing…", for: 2)
             self.stopSession(reason: .voice)
         }
-        pendingVoiceStop = work
+        session.pendingVoiceStop = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7, execute: work)
     }
 
     /// Escape during a recording — throw it away, insert nothing.
     private func cancelSession() {
-        guard isRecording else { return }
+        guard let session, session.isRecording else { return }
         Log.write("cancelled by Escape")
-        isRecording = false
-        pendingVoiceStop?.cancel()
-        pendingVoiceStop = nil
-        pauseTimer?.invalidate()
-        pauseTimer = nil
-        hotkey.watchClicks = false
-        hotkey.watchForCancel(false)
-        invalidateTimers()
-        recorder.stop()
-        stt?.cancel()
-        stt = nil
-        refreshIcon()
+        leaveRecordingState(session, reason: .hotkey)
+        session.client.cancel()
+        release(session)
         hud.apply(.notice("Cancelled"))
         hud.collapse(after: 0.9)
     }
@@ -909,114 +1036,155 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     ///
     /// Silence now means both signals are quiet: nothing above the noise floor on
     /// the microphone, and no new words. Either one alone keeps the session open.
-    private func noteVoiceActivity() {
-        lastVoiceAt = Date()
-    }
-
     /// Level is judged against a floor that adapts to the room, so a noisy
     /// environment does not read as constant speech and block the stop forever.
-    private func observe(level: Float) {
-        if level < noiseFloor {
-            noiseFloor = noiseFloor * 0.90 + level * 0.10      // settle downward quickly
+    private func observe(level: Float, for session: Session) {
+        if level < session.noiseFloor {
+            session.noiseFloor = session.noiseFloor * 0.90 + level * 0.10      // settle downward quickly
         } else {
-            noiseFloor = noiseFloor * 0.995 + level * 0.005    // rise only slowly
+            session.noiseFloor = session.noiseFloor * 0.995 + level * 0.005    // rise only slowly
         }
-        if level > max(0.07, noiseFloor * 2.5) { noteVoiceActivity() }
+        if level > max(0.07, session.noiseFloor * 2.5) { session.lastVoiceAt = Date() }
     }
 
-    private func startPauseWatch() {
+    private func startPauseWatch(_ session: Session) {
         pauseTimer?.invalidate()
         guard Defaults.pause > 0 else { return }
-        pauseTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            let quiet = Date().timeIntervalSince(self.lastVoiceAt)
+        pauseTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self, weak session] _ in
+            guard let self, let session else { return }
+            let quiet = Date().timeIntervalSince(session.lastVoiceAt)
             let window = Defaults.pause
             if ProcessInfo.processInfo.environment["QUILL_TRACE_STOP"] != nil {
-                Log.write("  tick rec=\(self.isRecording) sawText=\(self.sawAnyText) "
+                Log.write("  tick rec=\(session.isRecording) sawText=\(session.sawAnyText) "
                     + "quiet=\(String(format: "%.1f", quiet)) window=\(window)")
             }
-            guard self.isRecording, self.sawAnyText, window > 0, quiet >= window else { return }
+            guard session.isRecording, session === self.session, session.sawAnyText, window > 0, quiet >= window else { return }
             Log.write("pause stop: \(String(format: "%.1f", quiet))s of silence")
             self.hud.flashTarget("finishing…", for: 2)
             self.stopSession(reason: .voice)
         }
     }
 
-    private func stopSession(reason: StopReason) {
-        guard isRecording else { return }
-        isRecording = false
-        stopReason = reason
-        pendingVoiceStop?.cancel()
-        pendingVoiceStop = nil
-        pauseTimer?.invalidate()
-        pauseTimer = nil
+    /// Microphone off, timers down, clicks and Escape no longer watched. The
+    /// session moves on to waiting for its transcript.
+    private func leaveRecordingState(_ session: Session, reason: Session.StopReason) {
+        session.phase = .finalising
+        session.stopReason = reason
+        session.finaliseStartedAt = Date()
+        session.pendingVoiceStop?.cancel()
+        session.pendingVoiceStop = nil
         hotkey.watchClicks = false
         hotkey.watchForCancel(false)
         invalidateTimers()
         recorder.stop()
         refreshIcon()
+    }
+
+    private func stopSession(reason: Session.StopReason) {
+        guard let session, session.isRecording else { return }
+        leaveRecordingState(session, reason: reason)
 
         // Never discard the session just because no partial has arrived yet — on
         // the first recording the socket is often still connecting. Let it finish
         // and decide on the actual transcript instead.
-        Log.write("stop (\(reason == .click ? "click" : (reason == .voice ? "voice" : "hotkey/pill"))) — finalising, sawText=\(sawAnyText)")
-        finaliseStartedAt = Date()
-        logAudioState()
+        Log.write("stop (\(reason == .click ? "click" : (reason == .voice ? "voice" : "hotkey/pill"))) — finalising, sawText=\(session.sawAnyText)")
+        logAudioState(session)
         hud.apply(.thinking)
-        stt?.finish()
+        session.client.finish()
     }
 
-    private func finishSession(with text: String) {
-        stt = nil
+    /// The stream died. While still recording, the first failure gets a fresh
+    /// socket with the audio replayed; a second one ends the recording but keeps
+    /// whatever words made it through rather than throwing them away.
+    private func handleFailure(_ session: Session, _ failure: STTClient.Failure) {
+        let heard = session.client.transcript
+        Log.write("speech-to-text failed — \(failure.message) (phase=\(session.phase), heard \(heard.count) chars)")
+
+        if session.isRecording {
+            if failure != .unauthorized, reconnect(session, why: failure.message) { return }
+            leaveRecordingState(session, reason: .hotkey)
+            if !heard.isEmpty {
+                if session.ownsHUD { hud.apply(.thinking) }
+                finishSession(session, with: heard)
+                return
+            }
+            abortSession(session, message: failure.message)
+            return
+        }
+
+        // Already stopped: the words are final as far as the user is concerned.
+        if !heard.isEmpty {
+            finishSession(session, with: heard)
+        } else {
+            abortSession(session, message: failure.message)
+        }
+    }
+
+    private func finishSession(_ session: Session, with text: String) {
+        // A socket that dies mid-dictation completes with what it has; make sure
+        // the microphone and the timers are not left running behind it.
+        if session.isRecording { leaveRecordingState(session, reason: .hotkey) }
+        session.phase = .delivering
+
         // The command phrase must never reach the target app.
         let trimmed = VoiceCommands.stripAll(text).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            if didRunVoiceCommand {
+            release(session)
+            if selfTestPath != nil {
+                FileHandle.standardError.write(Data("SELFTEST RESULT: <empty> — \(diagnosis(session))\n".utf8))
+                endSelfTestWhenIdle(after: 0.5)
+            }
+            guard session.ownsHUD else { return }
+            if session.didRunVoiceCommand {
                 hud.apply(.notice("Opened Grok Build"))
                 hud.collapse(after: 1.6)
             } else {
-                hud.apply(.notice(diagnosis()))
+                hud.apply(.notice(diagnosis(session)))
                 hud.collapse(after: 4)
             }
             return
         }
 
         remember(trimmed)
-        hud.update(text: trimmed)
+        if session.ownsHUD { hud.update(text: trimmed) }
 
         guard Defaults.bool(Defaults.polish), let creds = Auth.current() else {
-            completeSession(with: trimmed)
+            completeSession(session, with: trimmed)
             return
         }
 
         // Show the raw words while the cleanup runs, so nothing appears to stall.
-        hud.apply(.thinking)
-        hud.update(text: trimmed)
+        if session.ownsHUD {
+            hud.apply(.thinking)
+            hud.update(text: trimmed)
+        }
         Polisher.polish(trimmed, token: creds.token) { [weak self] result in
-            self?.completeSession(with: result)
+            self?.completeSession(session, with: result)
         }
     }
 
     /// Everything after the text is final, whichever way it got there. The
     /// self-test lives on this path too — routing it around the real one is how
     /// three separate features ended up appearing to pass while untested.
-    private func completeSession(with trimmed: String) {
+    private func completeSession(_ session: Session, with trimmed: String) {
         if selfTestPath != nil {
             FileHandle.standardError.write(Data("SELFTEST RESULT: \(trimmed)\n".utf8))
             // Lets a test wait for background work (e.g. launching Grok) to finish.
             let hold = Double(ProcessInfo.processInfo.environment["QUILL_SELFTEST_HOLD"] ?? "") ?? 0
             guard ProcessInfo.processInfo.environment["QUILL_SELFTEST_INSERT"] != nil else {
-                hud.apply(.delivered(nil))
-                hud.collapse(after: 0.7)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2 + hold) { NSApp.terminate(nil) }
+                if session.ownsHUD {
+                    hud.apply(.delivered(nil))
+                    hud.collapse(after: 0.7)
+                }
+                release(session)
+                endSelfTestWhenIdle(after: 0.2 + hold)
                 return
             }
             FileHandle.standardError.write(Data("SELFTEST FOCUS: \(Inserter.describeFocus())\n".utf8))
-            let testSelection = self.capturedSelection
-            self.capturedSelection = nil
             Inserter.insert(trimmed,
                             atEndOfField: Defaults.bool(Defaults.insertAtEnd),
-                            replacing: testSelection) { outcome in
+                            replacing: session.selection,
+                            language: currentLanguage) { outcome in
                 let method: String
                 switch outcome.method {
                 case .accessibility: method = "accessibility"
@@ -1035,67 +1203,88 @@ final class QuillApp: NSObject, NSApplicationDelegate {
                 SELFTEST FIELD NOW: \(readback)
 
                 """.utf8))
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { NSApp.terminate(nil) }
+                self.release(session)
+                self.endSelfTestWhenIdle(after: 2.2)
             }
             return
         }
 
-        deliver(trimmed)
+        deliver(session, trimmed)
+    }
+
+    /// The self-test quits once every dictation it started has finished — with
+    /// QUILL_SELFTEST_OVERLAP there are two, and the first must not take the
+    /// process down while the second is still waiting for its words.
+    private func endSelfTestWhenIdle(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard self.session == nil, self.superseded.isEmpty else { return }
+            NSApp.terminate(nil)
+        }
     }
 
     /// Put the finished text into the focused app.
-    private func deliver(_ trimmed: String) {
+    private func deliver(_ session: Session, _ trimmed: String) {
         // After a click we wait a beat: the click still has to land, focus has to
         // settle, and the app has to place its caret before we write into it.
-        let settle: TimeInterval = (stopReason == .click) ? 0.22 : 0.16
-        if deliverToOpenedGrok {
+        let settle: TimeInterval = (session.stopReason == .click) ? 0.22 : 0.16
+        if session.deliverToOpenedGrok {
             GrokLauncher.bringToFront()
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + settle) { [weak self] in
             guard let self else { return }
-            if self.deliverToOpenedGrok {
+            if session.deliverToOpenedGrok {
                 GrokLauncher.bringToFront()
             }
-            let selection = self.capturedSelection
-            self.capturedSelection = nil
             Inserter.insert(trimmed,
                             atEndOfField: Defaults.bool(Defaults.insertAtEnd),
-                            replacing: selection) { outcome in
+                            replacing: session.selection,
+                            language: self.currentLanguage) { outcome in
                 switch outcome.method {
                 case .accessibility, .clipboard:
-                    if let started = self.finaliseStartedAt {
+                    if let started = session.finaliseStartedAt {
                         Log.write("  tail: stop → inserted in "
                             + String(format: "%.2fs", Date().timeIntervalSince(started)))
                     }
-                    self.hud.apply(.delivered(outcome.app))
-                    self.hud.update(text: trimmed)
-                    self.hud.collapse(after: 0.7)
+                    if session.ownsHUD {
+                        self.hud.apply(.delivered(outcome.app))
+                        self.hud.update(text: trimmed)
+                        self.hud.collapse(after: 0.7)
+                    } else if self.isRecording {
+                        // A newer dictation is on screen; do not collapse it.
+                        self.hud.flashTarget("previous dictation inserted", for: 1.5)
+                    }
                 case .blocked:
-                    self.hud.apply(.notice("Grant Accessibility to Quill so it can write into apps"))
-                    self.hud.collapse(after: 4)
+                    if session.ownsHUD {
+                        self.hud.apply(.notice("Grant Accessibility to Quill so it can write into apps"))
+                        self.hud.collapse(after: 4)
+                    }
                     Inserter.requestTrust()
                 }
+                self.release(session)
             }
         }
     }
 
-    private func abortSession(message: String) {
+    private func abortSession(_ session: Session, message: String) {
         Log.write("aborted — \(message)")
-        isRecording = false
-        pendingVoiceStop?.cancel()
-        pendingVoiceStop = nil
-        pauseTimer?.invalidate()
-        pauseTimer = nil
-        hotkey.watchClicks = false
-        hotkey.watchForCancel(false)
-        invalidateTimers()
-        recorder.stop()
-        stt?.cancel()
-        stt = nil
-        refreshIcon()
+        if session.isRecording { leaveRecordingState(session, reason: .hotkey) }
+        session.client.cancel()
+        release(session)
+        if selfTestPath != nil {
+            FileHandle.standardError.write(Data("SELFTEST ABORTED: \(message)\n".utf8))
+            endSelfTestWhenIdle(after: 0.5)
+        }
+        guard session.ownsHUD else { return }
         hud.apply(.notice(message))
         hud.collapse(after: 4)
+    }
+
+    /// The session is over, one way or another. Forget it.
+    private func release(_ session: Session) {
+        if self.session === session { self.session = nil }
+        superseded.removeAll { $0 === session }
     }
 
     private func invalidateTimers() {
@@ -1104,6 +1293,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         maxDurationTimer = nil
         tickTimer = nil
         selfTestTimer = nil
+        pauseTimer = nil
     }
 
     /// Recent dictations, for re-copying from the menu.
