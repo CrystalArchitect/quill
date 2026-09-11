@@ -188,6 +188,7 @@ enum Inserter {
     static func insert(_ text: String,
                        atEndOfField: Bool,
                        replacing selection: Selection? = nil,
+                       language: String = "en",
                        completion: @escaping (Outcome) -> Void) {
         let app = frontmostAppName()
         Log.write("insert → \(app ?? "?") · \(describeFocus()) · trusted=\(isTrusted)")
@@ -232,19 +233,29 @@ enum Inserter {
         // Whatever we could not move stays where the user left it, so judge the
         // boundary by the actual insertion point rather than assuming the end.
         let boundaryOffset = landingAtEnd ? existing?.utf16.count : (caretBefore ?? existing?.utf16.count)
-        // Both sides matter. Text dropped at the caret has something after it as
-        // well as before, and only padding the front still runs it into whatever
-        // follows.
-        let before = needsSeparator(before: existing, at: boundaryOffset, inserting: payload)
-        let after = needsTrailingSeparator(in: existing, at: boundaryOffset, inserting: payload)
-        if before { payload = " " + payload }
-        if after { payload += " " }
+
+        // Make the words fit what is around them: lowercase a first word that
+        // lands mid-sentence, drop a full stop that lands in front of more of
+        // the same sentence, and pad either side only where they would collide.
+        payload = TextTidy.fit(payload, into: existing, at: boundaryOffset, language: language)
+        if payload != text {
+            Log.write("  fitted: caseChanged=\(payload.trimmingCharacters(in: .whitespaces).first != text.first) "
+                + "leadSpace=\(payload.hasPrefix(" ")) trailSpace=\(payload.hasSuffix(" ")) "
+                + "atEnd=\(landingAtEnd) boundary=\(boundaryOffset.map(String.init) ?? "?")/\(existing?.utf16.count ?? -1)")
+        }
 
         let forceClipboard = ProcessInfo.processInfo.environment["QUILL_FORCE_CLIPBOARD"] != nil
-        if !forceClipboard, setSelectedText(payload), confirmLanded(payload) {
-            Log.write("  → accessibility, confirmed")
-            completion(Outcome(method: .accessibility, app: app))
-            return
+        if !forceClipboard {
+            let wrote = setSelectedText(payload)
+            if wrote, confirmLanded(payload) {
+                Log.write("  → accessibility, confirmed")
+                completion(Outcome(method: .accessibility, app: app))
+                return
+            }
+            // Which half failed matters: a setter that succeeds but does not show
+            // up on read-back is a web view quietly ignoring us, and the paste
+            // below is the only way in.
+            Log.write("  accessibility write \(wrote ? "accepted but not visible on read-back" : "refused") — pasting instead")
         }
 
         insertViaClipboard(payload) {
@@ -286,59 +297,6 @@ enum Inserter {
         // swiftlint:disable:next force_cast
         guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
         return range.location + range.length
-    }
-
-    /// Should a space go between what is already there and what we are adding?
-    ///
-    /// Only when the two would otherwise collide: there is text before the
-    /// insertion point, it does not already end in whitespace or an opening
-    /// bracket, and the new text does not begin with punctuation that belongs
-    /// tight against the previous word.
-    private static func needsSeparator(before existing: String?,
-                                       at offset: Int?,
-                                       inserting text: String) -> Bool {
-        guard let existing, !existing.isEmpty, let offset, offset > 0 else { return false }
-        guard let boundary = character(in: existing, before: offset) else { return false }
-
-        if boundary.isWhitespace || boundary.isNewline { return false }
-        if "([{<\u{201C}\u{2018}\"'-–—/@#".contains(boundary) { return false }
-
-        if let first = text.first, ",.;:!?)]}%\u{201D}\u{2019}".contains(first) { return false }
-        return true
-    }
-
-    /// Should a space go between what we are adding and what already follows?
-    ///
-    /// Only relevant when landing mid-text — appending at the end has nothing
-    /// after it. Mirrors the leading rule: skip it if the next character is
-    /// already whitespace, or is punctuation that belongs tight against a word.
-    private static func needsTrailingSeparator(in existing: String?,
-                                               at offset: Int?,
-                                               inserting text: String) -> Bool {
-        guard let existing, let offset, offset < existing.utf16.count else { return false }
-        guard let next = character(in: existing, atOrAfter: offset) else { return false }
-
-        if next.isWhitespace || next.isNewline { return false }
-        if ",.;:!?)]}%\u{201D}\u{2019}".contains(next) { return false }
-
-        if let last = text.last, last.isWhitespace { return false }
-        return true
-    }
-
-    private static func character(in text: String, atOrAfter utf16Offset: Int) -> Character? {
-        let units = text.utf16
-        guard utf16Offset >= 0, utf16Offset < units.count else { return nil }
-        let position = units.index(units.startIndex, offsetBy: utf16Offset)
-        guard let index = String.Index(position, within: text), index < text.endIndex else { return nil }
-        return text[index]
-    }
-
-    private static func character(in text: String, before utf16Offset: Int) -> Character? {
-        let units = text.utf16
-        guard utf16Offset > 0, utf16Offset <= units.count else { return nil }
-        let end = units.index(units.startIndex, offsetBy: utf16Offset)
-        guard let index = String.Index(end, within: text), index > text.startIndex else { return nil }
-        return text[text.index(before: index)]
     }
 
     private static func focusedElement() -> AXUIElement? {
