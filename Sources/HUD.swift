@@ -212,28 +212,45 @@ final class HUD {
         set { UserDefaults.standard.set(Double(newValue), forKey: Self.offsetKey) }
     }
 
+    private static let screenKey = "hudScreen"
+
+    /// The display the panel lives on. The one it was last dropped on wins, for
+    /// as long as it is connected; otherwise wherever it was last drawn, then
+    /// the main display. Before this was remembered, the panel came back on the
+    /// main display after every relaunch, whatever you had chosen.
     private var homeScreen: NSScreen? {
-        NSScreen.screens.first { $0.frame.contains(NSPoint(x: lastCentreX, y: lastCentreY)) }
+        let chosen = UserDefaults.standard.object(forKey: Self.screenKey) as? UInt32
+        let remembered = chosen.flatMap { id in NSScreen.screens.first { Self.displayID(of: $0) == id } }
+        return remembered
+            ?? NSScreen.screens.first { $0.frame.contains(NSPoint(x: lastCentreX, y: lastCentreY)) }
             ?? NSScreen.main ?? NSScreen.screens.first
     }
     private var lastCentreX: CGFloat = 0
     private var lastCentreY: CGFloat = 0
 
+    private static func displayID(of screen: NSScreen) -> UInt32? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
     func resetPosition() {
         UserDefaults.standard.removeObject(forKey: Self.edgeKey)
         UserDefaults.standard.removeObject(forKey: Self.offsetKey)
+        UserDefaults.standard.removeObject(forKey: Self.screenKey)
         UserDefaults.standard.removeObject(forKey: "hudAnchor")
         apply(state, animated: true)
     }
 
-    /// Called when a drag finishes: pick the nearer edge and remember the height.
+    /// Called when a drag finishes: pick the nearer edge and remember the height
+    /// and the display.
     func snapToEdge(from frame: NSRect) {
         let centre = NSPoint(x: frame.midX, y: frame.midY)
         lastCentreX = centre.x
         lastCentreY = centre.y
         let screen = NSScreen.screens.first { $0.frame.contains(centre) }
             ?? NSScreen.main ?? NSScreen.screens.first
-        guard let visible = screen?.visibleFrame else { return }
+        guard let screen, let id = Self.displayID(of: screen) else { return }
+        let visible = screen.visibleFrame
+        UserDefaults.standard.set(id, forKey: Self.screenKey)
 
         dockEdge = (centre.x - visible.minX) < (visible.maxX - centre.x) ? .left : .right
         let fraction = (visible.maxY - centre.y) / max(visible.height, 1)
@@ -266,11 +283,16 @@ final class HUD {
     }
 
     /// Keeps a frame wholly inside one display — used while dragging.
-    static func confine(_ rect: NSRect) -> NSRect {
-        let centre = NSPoint(x: rect.midX, y: rect.midY)
-        let screen = NSScreen.screens.first { $0.frame.contains(centre) }
+    ///
+    /// The display is the one under the pointer, not under the panel. Judging by
+    /// the panel's own centre meant it was clamped inside the display it started
+    /// on and its centre could never cross the boundary, so it could not be
+    /// dragged to a second monitor at all (issue #5). Following the pointer, it
+    /// hops across as soon as you do.
+    static func confine(_ rect: NSRect, near pointer: NSPoint) -> NSRect {
+        let screen = NSScreen.screens.first { $0.frame.contains(pointer) }
             ?? NSScreen.screens.min { a, b in
-                distance(from: centre, to: a.frame) < distance(from: centre, to: b.frame)
+                distance(from: pointer, to: a.frame) < distance(from: pointer, to: b.frame)
             }
         guard let visible = screen?.visibleFrame else { return rect }
         var out = rect
@@ -618,7 +640,7 @@ private final class HUDView: NSView {
 
         var frame = window.frame
         frame.origin = NSPoint(x: frame.origin.x + dx, y: frame.origin.y + dy)
-        window.setFrame(HUD.confine(frame), display: true)
+        window.setFrame(HUD.confine(frame, near: now), display: true)
         dragOrigin = now
     }
 
